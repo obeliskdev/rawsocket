@@ -12,6 +12,5 @@ func TestToIPIterator(t *testing.T) {
 
 	for iterator.HasNext() {
 		iterator.Next()
-		continue
 	}
 }

@@ -36,16 +36,18 @@ func (icmp *ICMP) BuildWithError(src, dest net.IPAddr) ([]byte, error) {
 	}
 	
 	payload := icmp.Payload
-	
+
+	var layerBuf [3]gopacket.SerializableLayer
+	layers := layerBuf[:2]
+	layers[0] = serializableIP
+	layers[1] = &scratch.icmp
 	if len(payload) > 0 {
-		if err := gopacket.SerializeLayers(scratch.buf, serializeOptions, serializableIP, &scratch.icmp, gopacket.Payload(payload)); err != nil {
-			return nil, err
-		}
-	} else {
-		if err := gopacket.SerializeLayers(scratch.buf, serializeOptions, serializableIP, &scratch.icmp); err != nil {
-			return nil, err
-		}
+		layers = append(layers, gopacket.Payload(payload))
 	}
-	
+
+	if err := gopacket.SerializeLayers(scratch.buf, serializeOptions, layers...); err != nil {
+		return nil, err
+	}
+
 	return cloneSerializedBytes(scratch.buf), nil
 }

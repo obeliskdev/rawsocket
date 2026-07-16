@@ -1,8 +1,22 @@
-# rawsocket
+# rawsocket — Go Raw IP Packet Builder & Cross-Platform Raw Socket Library
 
-`rawsocket` is a Go library for crafting and sending raw IP packets.
+[![Go Reference](https://pkg.go.dev/badge/github.com/obeliskdev/rawsocket.svg)](https://pkg.go.dev/github.com/obeliskdev/rawsocket)
+[![Go Version](https://img.shields.io/badge/Go-1.25+-00ADD8.svg)](https://go.dev)
 
-It supports TCP, UDP, ICMP, IGMP, ESP, and custom raw IP payloads, with a cross-platform socket abstraction for sending and receiving packets.
+`rawsocket` is a high-performance Go library for crafting, sending, and receiving raw IP packets.
+It supports TCP, UDP, ICMP, IGMP, ESP, and custom raw IP payloads with a unified cross-platform
+socket abstraction (pcap on Windows, `AF_INET/SOCK_RAW` on Linux/macOS).
+
+## Features
+
+- **Packet crafting** — Build TCP, UDP, ICMP, IGMP, ESP, and raw IP packets with a fluent options API
+- **Cross-platform** — Windows (pcap/Npcap) and Unix (raw sockets) via a single `RawSocket` interface
+- **Zero-allocation hot paths** — Builders use `sync.Pool` and stack-allocated scratch buffers; `IPIterator.Next()` is alloc-free after warmup
+- **IPv4 & IPv6** — TCP/UDP/RawIP builders auto-select IP version; ICMP/IGMP are IPv4-only
+- **TCP legit options** — Automatic MSS, window scale, timestamps, and SACK for realistic SYN/ACK/FIN packets
+- **IP range iteration** — Parse CIDRs, ranges, and single IPs; shuffle and skip-local-address support
+- **Thread-safe** — `GetSelfIP` uses `sync.Once`; all shared state is lock-protected
+- **Packet stream** — `Iter()` returns a channel for reactive packet processing
 
 ## Safety and Permissions
 
@@ -10,7 +24,7 @@ Raw networking can affect live systems.
 
 - Use only in environments you control.
 - Linux/macOS usually require root or `CAP_NET_RAW`.
-- Windows requires administrator privileges and packet-capture support.
+- Windows requires administrator privileges and [Npcap](https://npcap.com/) with packet-capture support.
 
 ## Installation
 
@@ -20,7 +34,7 @@ go get github.com/obeliskdev/rawsocket
 
 ## Quick Start
 
-### 1. Build a TCP packet
+### 1. Build a TCP SYN packet
 
 ```go
 package main
@@ -42,6 +56,7 @@ func main() {
 		rawsocket.WithTCPSYN(true),
 		rawsocket.WithTCPSequence(1001),
 		rawsocket.WithTCPWindow(65535),
+		rawsocket.WithTCPLegitOptions(true), // MSS + window scale + timestamps
 	)
 	if err != nil {
 		panic(err)
@@ -77,33 +92,94 @@ if err != nil {
 fmt.Println("read", n, "bytes from", from.String())
 ```
 
+### 4. Stream packets via channel
+
+```go
+for wp := range sock.Iter() {
+	fmt.Printf("from %s: %d bytes\n", wp.IPAddr, len(wp.Packet.Data()))
+}
+```
+
 ## Packet Builders
 
-Convenience helpers:
-- `BuildTCPPacket`, `BuildUDPPacket`
-- `BuildICMPPacket`, `BuildIGMPPacket`
-- `BuildESPPacket`, `BuildRawIPPacket`
+### Convenience helpers
 
-Builder constructors:
-- `NewTCP`, `NewUDP`, `NewICMP`, `NewIGMP`, `NewESP`, `NewRawIP`
+Each returns `([]byte, error)` so errors are explicit in production code:
 
-Each builder supports options (`WithTCP...`, `WithUDP...`, etc.) for protocol-specific fields and payloads.
+| Helper | Protocol | Address Type |
+|--------|----------|--------------|
+| `BuildTCPPacket` | TCP | `net.TCPAddr` |
+| `BuildUDPPacket` | UDP | `net.UDPAddr` |
+| `BuildICMPPacket` | ICMPv4 | `net.IPAddr` |
+| `BuildIGMPPacket` | IGMP | `net.IPAddr` |
+| `BuildESPPacket` | ESP | `net.IPAddr` |
+| `BuildRawIPPacket` | Custom IP | `net.IPAddr` |
+
+### Builder constructors
+
+`NewTCP`, `NewUDP`, `NewICMP`, `NewIGMP`, `NewESP`, `NewRawIP` — each accepts variadic options.
+
+### Available options
+
+**TCP:** `WithTCPSYN`, `WithTCPACK`, `WithTCPRST`, `WithTCPPSH`, `WithTCPFIN`, `WithTCPURG`,
+`WithTCPECE`, `WithTCPCWR`, `WithTCPNS`, `WithTCPSequence`, `WithTCPAckNumber`, `WithTCPWindow`,
+`WithTCPPayload`, `WithTCPOptions`, `WithTCPLegitOptions`
+
+**UDP:** `WithUDPPayload`
+
+**ICMP:** `WithICMPType`, `WithICMPPayload`
+
+**IGMP:** `WithIGMPType`, `WithIGMPMaxResponseTime`, `WithIGMPGroupAddress`
+
+**ESP:** `WithESPSPI`, `WithESPSequence`, `WithESPPayload`
+
+**RawIP:** `WithRawIPProtocol`, `WithRawIPPayload`
+
+### IPv6 support
+
+TCP, UDP, and RawIP builders automatically detect IPv4/IPv6 based on the source and destination
+addresses. ICMP and IGMP builders currently support IPv4 only.
 
 ## Socket API
 
-`OpenRawSocket(protocol)` returns a `RawSocket` with:
-- `Write([]byte, net.Addr)`
-- `Read([]byte)`
-- `NextPacket()` (decoded `gopacket.Packet`)
-- `Iter()` (packet stream channel)
-- `Close()`
+`OpenRawSocket(protocol)` returns a `RawSocket` interface:
+
+```go
+type RawSocket interface {
+    Write([]byte, net.Addr) (int, error)
+    Read([]byte) (int, net.Addr, error)
+    NextPacket() (gopacket.Packet, *net.IPAddr, error)
+    Iter() chan WrappedPacket
+    Close() error
+}
+```
+
+### Supported protocols
+
+| Constant | Description |
+|----------|-------------|
+| `IPPROTO_TCP` | TCP packets |
+| `IPPROTO_UDP` | UDP packets |
+| `IPPROTO_ICMP` | ICMP (v4/v6 auto-selected) |
+| `IPPROTO_IGMP` | IGMP |
+| `IPPROTO_ESP` | IPSec ESP |
+| `IPPROTO_IP` | All IP packets |
+| `IPPROTO_RAW` | Raw (no protocol filtering) |
 
 ## Utilities
 
-- `GetSelfIP()` returns local outbound IPv4.
-- `ToIPIterator(...)` accepts IPs, CIDRs, and ranges.
+### GetSelfIP
 
-### Example: Iterate Targets
+```go
+ip := rawsocket.GetSelfIP() // cached, thread-safe, returns IPv4
+```
+
+Discovers the local outbound IPv4 address via a UDP dial (with 5s timeout), falling back to
+interface enumeration. Result is computed once via `sync.Once`.
+
+### IPIterator
+
+Accepts IPs, CIDRs, and hyphenated ranges. Supports shuffle and skip-local filtering.
 
 ```go
 it := rawsocket.ToIPIterator("8.8.8.8", "1.1.1.0/30", "192.168.1.10-192.168.1.12")
@@ -119,18 +195,44 @@ for it.HasNext() {
 }
 ```
 
-## Notes
+`Next()` is zero-allocation after the first call — IPs are incremented in place.
 
-- Prefer `Build...Packet(...)([]byte, error)` helpers in production so errors are explicit.
-- ICMP/IGMP builders operate on IPv4 packet formats.
+## Performance
+
+Builders use `sync.Pool` for scratch buffers and stack-allocated layer slices to minimize
+garbage collection pressure. Benchmark results (Windows, i7-13700K):
+
+| Benchmark | ns/op | B/op | allocs/op |
+|-----------|-------|------|-----------|
+| UDPBuild | ~140 | 120 | 2 |
+| ICMPBuild | ~145 | 120 | 2 |
+| TCPBuildSYN | ~107 | 48 | 1 |
+| IGMPBuild | ~125 | 64 | 3 |
+| ESPBuild | ~120 | 248 | 3 |
+| RawIPBuild | ~100 | 120 | 2 |
+
+Run benchmarks:
+
+```bash
+go test -bench=Benchmark -benchmem -run=^Benchmark
+```
 
 ## Testing
 
 ```bash
-go test ./...
+go test -race ./...
 ```
 
-Some tests may require elevated network permissions.
+Some tests require elevated network permissions (root/admin) and may be skipped automatically
+in unprivileged environments.
+
+## Notes
+
+- Prefer `Build...Packet(...)` helpers in production so errors are explicit.
+- ICMP/IGMP builders operate on IPv4 packet formats only.
+- The `LegitOptions` flag on TCP generates realistic TCP options (MSS, window scale,
+  timestamps, SACK) for SYN/ACK/FIN packets to mimic legitimate traffic.
+- Windows requires [Npcap](https://npcap.com/) installed for pcap-based capture.
 
 ## License
 

@@ -31,31 +31,25 @@ var (
 	SysSrcMac     *net.HardwareAddr
 	RouterMac     *net.HardwareAddr
 
-	once  sync.Once
-	mutex sync.RWMutex // Mutex to make shared variables thread-safe
+	once      sync.Once
+	mutex     sync.RWMutex
+	ipRawMode bool
 )
 
-// initialize initializes the network device and MAC addresses.
 func init() {
-	// Get the IP address of the current machine
 	SrcIP := GetSelfIP()
 	if SrcIP == nil {
 		return
 	}
 
-	// Find all available network devices
 	devices, err := pcap.FindAllDevs()
 	if err != nil {
 		panic(err)
 	}
 
-	// Iterate through each network device
 	for _, dev := range devices {
-		// Iterate through each IP address associated with the device
 		for _, address := range dev.Addresses {
-			// Check if the IP address matches the source IP address
 			if address.IP.Equal(SrcIP) {
-				// Set the network device to the matching device
 				mutex.Lock()
 				NetworkDevice = &dev
 				mutex.Unlock()
@@ -63,42 +57,39 @@ func init() {
 			}
 		}
 	}
-
-	// If no network device was found, panic with an error message
-	// Leave NetworkDevice nil if none matches; OpenRawSocket will return an error.
 }
 
-// waitForMac waits for a packet that contains the MAC address of the router.
-// It takes a pcap.Handle as input and returns nothing.
-// The function processes each packet from the packet source until it finds a packet with the MAC address.
 func waitForMac(packetSource *gopacket.PacketSource) {
-	// Get the IP address of the current device
 	ip := GetSelfIP()
 
-	// Process each packet from the packet source
 	for {
 		packet, err := packetSource.NextPacket()
 		if err != nil {
 			return
 		}
 
-		// Check if the packet has an IPv4 layer
 		if ipLayer := packet.Layer(layers.LayerTypeIPv4); ipLayer != nil {
-			// Check if RouterMac is not set
-			if RouterMac == nil {
-				// Check if the packet has an Ethernet layer
-				if ethernetLayer := packet.Layer(layers.LayerTypeEthernet); ethernetLayer != nil {
-					// Check if the source IP of the packet is equal to GetSelfIP()
-					if ipLayer.(*layers.IPv4).SrcIP.Equal(ip) {
-						ethernet := ethernetLayer.(*layers.Ethernet)
+			mutex.RLock()
+			routerSet := RouterMac != nil
+			mutex.RUnlock()
+			if routerSet {
+				return
+			}
 
-						// Set the source MAC address and the router MAC address
-						mutex.Lock()
-						SysSrcMac = &ethernet.SrcMAC
-						RouterMac = &ethernet.DstMAC
-						mutex.Unlock()
-						return
-					}
+			if ethernetLayer := packet.Layer(layers.LayerTypeEthernet); ethernetLayer != nil {
+				if ipLayer.(*layers.IPv4).SrcIP.Equal(ip) {
+					ethernet := ethernetLayer.(*layers.Ethernet)
+
+					srcMac := make(net.HardwareAddr, len(ethernet.SrcMAC))
+					copy(srcMac, ethernet.SrcMAC)
+					dstMac := make(net.HardwareAddr, len(ethernet.DstMAC))
+					copy(dstMac, ethernet.DstMAC)
+
+					mutex.Lock()
+					SysSrcMac = &srcMac
+					RouterMac = &dstMac
+					mutex.Unlock()
+					return
 				}
 			}
 		}
@@ -112,7 +103,6 @@ type PcapSocket struct {
 	source   *gopacket.PacketSource
 }
 
-// newPcapSocket creates a new PcapSocket with the given parameters.
 func newPcapSocket(isRaw bool, handle *pcap.Handle, protocol ProtocolType, source *gopacket.PacketSource) *PcapSocket {
 	return &PcapSocket{
 		isRaw:    isRaw,
@@ -122,23 +112,19 @@ func newPcapSocket(isRaw bool, handle *pcap.Handle, protocol ProtocolType, sourc
 	}
 }
 
-// Write writes the given bytes to the PcapSocket and returns the number of bytes written.
-// If addr is nil, it returns an error indicating that the address is nil.
-// If the bytes contain an Ethernet header and the PcapSocket is in IPRaw mode, it returns an error indicating that Ethernet is not supported in IPRaw mode.
-// If the bytes contain an Ethernet header, it writes the packet data to the handle and returns the number of bytes written.
-// If the bytes do not contain an Ethernet header, it creates a packet, extracts the network and transport layers from the packet, sets the network layer for checksum calculation if the transport layer is TCP or UDP, creates a serialize buffer, writes the buffer data to the handle, and returns the number of bytes written.
+var writeBufPool = sync.Pool{
+	New: func() any { return gopacket.NewSerializeBuffer() },
+}
+
 func (p *PcapSocket) Write(bytes []byte, addr net.Addr) (int, error) {
-	// Check if addr is nil
 	if addr == nil {
 		return 0, errors.New("addr is nil")
 	}
 
-	// Check if Ethernet is not supported in IPRaw mode
 	if hasEthernet(bytes) && p.isRaw {
 		return 0, errors.New("ethernet is not supported in IPRaw mode")
 	}
 
-	// Write the packet data if the bytes contain an Ethernet header
 	if hasEthernet(bytes) {
 		if err := p.WritePacketData(bytes); err != nil {
 			return 0, err
@@ -146,14 +132,12 @@ func (p *PcapSocket) Write(bytes []byte, addr net.Addr) (int, error) {
 		return len(bytes), nil
 	}
 
-	// Create a packet and get the network and transport layers
 	packet := createPacket(bytes)
 	layer3, layer4, err := getNetworkAndTransportLayers(packet)
 	if err != nil {
 		return 0, err
 	}
 
-	// Set the network layer for checksum calculation if the transport layer is TCP or UDP
 	if tcp, ok := layer4.(*layers.TCP); ok {
 		if err := tcp.SetNetworkLayerForChecksum(packet.NetworkLayer()); err != nil {
 			return 0, err
@@ -164,11 +148,30 @@ func (p *PcapSocket) Write(bytes []byte, addr net.Addr) (int, error) {
 		}
 	}
 
-	// Create a serialize buffer and write the buffer data to the handle
-	buffer, err := createSerializeBuffer(p.isRaw, layer3, layer4)
-	if err != nil {
-		return 0, err
+	buffer := writeBufPool.Get().(gopacket.SerializeBuffer)
+	defer writeBufPool.Put(buffer)
+	buffer.Clear()
+
+	if p.isRaw {
+		if err := gopacket.SerializeLayers(buffer, serializeOptions, layer3, layer4); err != nil {
+			return 0, err
+		}
+	} else {
+		mutex.RLock()
+		srcMac, routerMac := SysSrcMac, RouterMac
+		mutex.RUnlock()
+		if srcMac == nil || routerMac == nil {
+			return 0, errors.New("missing source or router MAC address")
+		}
+		if err := gopacket.SerializeLayers(buffer, serializeOptions, &layers.Ethernet{
+			SrcMAC:       *srcMac,
+			DstMAC:       *routerMac,
+			EthernetType: layers.EthernetTypeIPv4,
+		}, layer3, layer4); err != nil {
+			return 0, err
+		}
 	}
+
 	if err := p.WritePacketData(buffer.Bytes()); err != nil {
 		return 0, err
 	}
@@ -176,10 +179,6 @@ func (p *PcapSocket) Write(bytes []byte, addr net.Addr) (int, error) {
 	return len(bytes), nil
 }
 
-// createPacket creates a gopacket.Packet from the given bytes.
-// It checks if the bytes represent an IPv4 packet, and if so,
-// creates the packet with the IPv4 layer type. Otherwise, it
-// creates the packet with the IPv6 layer type.
 func createPacket(bytes []byte) gopacket.Packet {
 	if isIPv4(bytes) {
 		return gopacket.NewPacket(bytes, layers.LayerTypeIPv4, decodeOptions)
@@ -187,9 +186,7 @@ func createPacket(bytes []byte) gopacket.Packet {
 	return gopacket.NewPacket(bytes, layers.LayerTypeIPv6, decodeOptions)
 }
 
-// getNetworkAndTransportLayers returns the network and transport layers of a packet as serializable layers.
 func getNetworkAndTransportLayers(packet gopacket.Packet) (gopacket.SerializableLayer, gopacket.SerializableLayer, error) {
-	// Retrieve the network layer and assert it as a serializable layer
 	network := packet.NetworkLayer()
 	if network == nil {
 		return nil, nil, errors.New("missing network layer")
@@ -199,7 +196,6 @@ func getNetworkAndTransportLayers(packet gopacket.Packet) (gopacket.Serializable
 		return nil, nil, errors.New("network layer is not serializable")
 	}
 
-	// Retrieve the transport layer and assert it as a serializable layer
 	transport := packet.TransportLayer()
 	if transport == nil {
 		return nil, nil, errors.New("missing transport layer")
@@ -209,56 +205,24 @@ func getNetworkAndTransportLayers(packet gopacket.Packet) (gopacket.Serializable
 		return nil, nil, errors.New("transport layer is not serializable")
 	}
 
-	// Return the network and transport layers
 	return layer3, layer4, nil
 }
 
-// createSerializeBuffer creates a serialize buffer based on the given parameters.
-// If isRaw is true, it serializes layer3 and layer4 into the buffer.
-// If isRaw is false, it serializes layer3, layer4, and an Ethernet layer with source and destination MAC addresses and Ethernet type IPv4.
-// It returns the serialize buffer.
-func createSerializeBuffer(isRaw bool, layer3, layer4 gopacket.SerializableLayer) (gopacket.SerializeBuffer, error) {
-	buffer := gopacket.NewSerializeBuffer()
-
-	if isRaw {
-		if err := gopacket.SerializeLayers(buffer, serializeOptions, layer3, layer4); err != nil {
-			return nil, err
-		}
-	} else {
-		if SysSrcMac == nil || RouterMac == nil {
-			return nil, errors.New("missing source or router MAC address")
-		}
-		if err := gopacket.SerializeLayers(buffer, serializeOptions, &layers.Ethernet{
-			SrcMAC:       *SysSrcMac,
-			DstMAC:       *RouterMac,
-			EthernetType: layers.EthernetTypeIPv4,
-		}, layer3, layer4); err != nil {
-			return nil, err
-		}
-	}
-
-	return buffer, nil
-}
-
-// NextPacket returns the next packet from the PcapSocket.
 func (p *PcapSocket) NextPacket() (gopacket.Packet, *net.IPAddr, error) {
 	for {
 		packet, err := p.source.NextPacket()
-
 		if err != nil {
 			return nil, nil, err
 		}
 
 		var ipAddr net.IP
 
-		// Extract the source IP address from the packet
-		if Ip4Layer := packet.Layer(layers.LayerTypeIPv4); Ip4Layer != nil {
-			ipAddr = Ip4Layer.(*layers.IPv4).SrcIP
-		} else if Ip6Layer := packet.Layer(layers.LayerTypeIPv6); Ip6Layer != nil {
-			ipAddr = Ip6Layer.(*layers.IPv6).SrcIP
+		if ip4Layer := packet.Layer(layers.LayerTypeIPv4); ip4Layer != nil {
+			ipAddr = ip4Layer.(*layers.IPv4).SrcIP
+		} else if ip6Layer := packet.Layer(layers.LayerTypeIPv6); ip6Layer != nil {
+			ipAddr = ip6Layer.(*layers.IPv6).SrcIP
 		}
 
-		// Check if the packet matches the specified protocol
 		switch p.protocol {
 		case IPPROTO_TCP:
 			if packet.Layer(layers.LayerTypeTCP) == nil {
@@ -291,76 +255,36 @@ func (p *PcapSocket) NextPacket() (gopacket.Packet, *net.IPAddr, error) {
 		}
 
 		return packet, &net.IPAddr{IP: ipAddr}, nil
-
 	}
 }
 
 func (p *PcapSocket) Iter() chan WrappedPacket {
-	// Create a buffered channel with a capacity of 1024.
 	packets := make(chan WrappedPacket, 1024)
-	// Start a goroutine that will call the startIter method and pass the packets channel.
-	go p.startIter(packets)
-	// Return the packets channel.
+	go packetIter(packets, p.NextPacket)
 	return packets
 }
 
-// startIter starts iterating over packets from the PcapSocket and sends them to the provided channel.
-func (p *PcapSocket) startIter(packets chan WrappedPacket) {
-	for {
-		// Get the next packet from the PcapSocket.
-		packet, addr, err := p.NextPacket()
-		if err != nil {
-			continue
-		}
-
-		// Send the packet to the packets channel.
-		func() {
-			defer func() {
-				if recover() != nil {
-					packets = nil
-				}
-			}()
-			if packets == nil {
-				return
-			}
-			packets <- WrappedPacket{
-				IPAddr: addr,
-				Packet: packet,
-			}
-		}()
-		if packets == nil {
-			return
-		}
-	}
-}
-
-// Read reads bytes from the packet socket and returns the number of bytes read,
-// the source address of the packet, and any error encountered.
-// It uses the provided byte slice to copy the data read from the packet.
 func (p *PcapSocket) Read(bytes []byte) (int, net.Addr, error) {
-	// Iterate over packets received from the source
 	for {
 		packet, addr, err := p.NextPacket()
 		if err != nil {
 			return 0, nil, err
 		}
 
-		// Extract the data from the packet based on the specified protocol
 		switch p.protocol {
 		case IPPROTO_UDP, IPPROTO_TCP:
-			// Get the transport layer data for UDP or TCP packets
 			if transportLayer := packet.TransportLayer(); transportLayer != nil {
 				n := copy(bytes, transportLayer.LayerContents())
 				n += copy(bytes[n:], transportLayer.LayerPayload())
 				return n, addr, nil
 			}
 		case IPPROTO_IP:
-			// Get the network layer data for IP packets
 			if networkLayer := packet.NetworkLayer(); networkLayer != nil {
-				return copy(bytes, networkLayer.LayerContents()), addr, nil
+				n := copy(bytes, networkLayer.LayerContents())
+				n += copy(bytes[n:], networkLayer.LayerPayload())
+				return n, addr, nil
 			}
 		case IPPROTO_ICMP:
-			// Get the network layer data for ICMP packets
 			if networkLayer := packet.NetworkLayer(); networkLayer != nil {
 				n := copy(bytes, networkLayer.LayerContents())
 				n += copy(bytes[n:], networkLayer.LayerPayload())
@@ -368,49 +292,39 @@ func (p *PcapSocket) Read(bytes []byte) (int, net.Addr, error) {
 			}
 		case IPPROTO_IGMP:
 			if igmpLayer := packet.Layer(layers.LayerTypeIGMP); igmpLayer != nil {
-				layer := igmpLayer.LayerContents()
-				payload := igmpLayer.LayerPayload()
-				n := copy(bytes, layer)
-				n += copy(bytes[n:], payload)
+				n := copy(bytes, igmpLayer.LayerContents())
+				n += copy(bytes[n:], igmpLayer.LayerPayload())
 				return n, addr, nil
 			}
 		case IPPROTO_ESP:
 			if espLayer := packet.Layer(layers.LayerTypeIPSecESP); espLayer != nil {
-				layer := espLayer.LayerContents()
-				payload := espLayer.LayerPayload()
-				n := copy(bytes, layer)
-				n += copy(bytes[n:], payload)
+				n := copy(bytes, espLayer.LayerContents())
+				n += copy(bytes[n:], espLayer.LayerPayload())
 				return n, addr, nil
 			}
 		default:
-			// Get the raw packet data for other protocols
 			return copy(bytes, packet.Data()), addr, nil
 		}
 	}
 }
 
-// Close closes the PcapSocket by closing the underlying handle.
-// It returns an error if there was a problem closing the handle.
 func (p *PcapSocket) Close() error {
 	p.Handle.Close()
 	return nil
 }
 
-// OpenRawSocket opens a raw socket for the given protocol.
-// It returns a PcapSocket and an error, if any.
 func OpenRawSocket(protocol ProtocolType) (RawSocket, error) {
-	if NetworkDevice == nil {
+	mutex.RLock()
+	device := NetworkDevice
+	mutex.RUnlock()
+	if device == nil {
 		return nil, errors.New("network device not found")
 	}
 
-	// Open a live capture on the network device with a maximum packet length of 255 bytes.
-	handle, err := pcap.OpenLive(NetworkDevice.Name, 255, true, pcap.BlockForever)
+	handle, err := pcap.OpenLive(device.Name, 255, true, pcap.BlockForever)
 	if err != nil {
 		return nil, err
 	}
-
-	// Flag to determine if IP raw mode is needed.
-	var ipRaw bool
 
 	source := gopacket.NewPacketSource(handle, handle.LinkType())
 	source.NoCopy = true
@@ -418,17 +332,14 @@ func OpenRawSocket(protocol ProtocolType) (RawSocket, error) {
 
 	var onceErr error
 	once.Do(func() {
-		// Update the MAC address.
 		if err := updateMac(handle); err != nil {
 			if strings.Contains(err.Error(), "mismatched hardware address sizes") {
-				ipRaw = true
+				ipRawMode = true
 				return
 			}
 			onceErr = err
 			return
 		}
-
-		// Wait for the MAC address to be set.
 		waitForMac(source)
 	})
 	if onceErr != nil {
@@ -436,34 +347,29 @@ func OpenRawSocket(protocol ProtocolType) (RawSocket, error) {
 		return nil, onceErr
 	}
 
-	// Create a new PcapSocket with the necessary parameters.
-	return newPcapSocket(ipRaw, handle, protocol, source), nil
+	return newPcapSocket(ipRawMode, handle, protocol, source), nil
 }
 
-// isIPv4 checks if the given byte slice represents an IPv4 address.
 func isIPv4(bytes []byte) bool {
-	// Check if the first byte is equal to 0x45, which represents the version number and header length in an IPv4 packet.
 	if len(bytes) == 0 {
 		return false
 	}
 	return bytes[0]>>4 == 4
 }
 
-// updateMac updates the MAC address of the network interface used by the pcap handle.
-// It sends an ARP request packet to retrieve the MAC address and updates the handle's MAC address if successful.
 func updateMac(handle *pcap.Handle) error {
-	// If the MAC address is already set, no need to update it.
-	if SysSrcMac != nil {
+	mutex.RLock()
+	srcSet := SysSrcMac != nil
+	mutex.RUnlock()
+	if srcSet {
 		return nil
 	}
 
-	// Get the local MAC address.
 	localMAC, err := GetLocalMac()
 	if err != nil {
 		return err
 	}
 
-	// Create an ARP packet with the necessary fields.
 	arpPacket := &layers.ARP{
 		AddrType:          layers.LinkTypeEthernet,
 		Protocol:          layers.EthernetTypeIPv4,
@@ -476,20 +382,19 @@ func updateMac(handle *pcap.Handle) error {
 		DstProtAddress:    GetSelfIP(),
 	}
 
-	// Create an Ethernet packet with the ARP packet as payload.
 	ethernetPacket := &layers.Ethernet{
 		SrcMAC:       localMAC,
 		DstMAC:       net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
 		EthernetType: layers.EthernetTypeARP,
 	}
 
-	// Serialize the Ethernet and ARP packets into a buffer.
-	buffer := gopacket.NewSerializeBuffer()
+	buffer := writeBufPool.Get().(gopacket.SerializeBuffer)
+	defer writeBufPool.Put(buffer)
+	buffer.Clear()
 	if err := gopacket.SerializeLayers(buffer, serializeOptions, ethernetPacket, arpPacket); err != nil {
 		return err
 	}
 
-	// Write the buffer to the pcap handle to send the packet.
 	if err := handle.WritePacketData(buffer.Bytes()); err != nil {
 		return err
 	}
@@ -497,26 +402,20 @@ func updateMac(handle *pcap.Handle) error {
 	return nil
 }
 
-// GetLocalMac retrieves the local MAC address.
 func GetLocalMac() (net.HardwareAddr, error) {
-	// Get all network interfaces
 	interfaces, err := net.Interfaces()
 	if err != nil {
 		return nil, err
 	}
 
-	// Get the IP address of the current machine
 	selfIP := GetSelfIP()
 
-	// Iterate through each network interface
 	for _, iface := range interfaces {
-		// Get the list of addresses associated with the interface
 		addrs, err := iface.Addrs()
 		if err != nil {
-			return nil, err
+			continue
 		}
 
-		// Check if any of the addresses match the IP of the current machine
 		for _, addr := range addrs {
 			if isSameIP(addr, selfIP) {
 				return iface.HardwareAddr, nil
@@ -527,11 +426,6 @@ func GetLocalMac() (net.HardwareAddr, error) {
 	return nil, fmt.Errorf("failed to retrieve local MAC address")
 }
 
-// isSameIP checks if the given network address is the same as the self IP.
-//
-// If the network address is of type *net.IPAddr or *net.IPNet,
-// it compares the IP of the address with the self IP and returns true if they are equal.
-// Otherwise, it returns false.
 func isSameIP(addr net.Addr, selfIP net.IP) bool {
 	switch v := addr.(type) {
 	case *net.IPAddr:
@@ -539,12 +433,9 @@ func isSameIP(addr net.Addr, selfIP net.IP) bool {
 	case *net.IPNet:
 		return v.IP.Equal(selfIP)
 	}
-
 	return false
 }
 
-// hasEthernet checks if the given byte slice represents an Ethernet frame.
 func hasEthernet(bytes []byte) bool {
-	// Check if the first byte is 0x08 and the second byte is 0x00.
 	return len(bytes) > 13 && bytes[12] == 0x08 && bytes[13] == 0x00
 }

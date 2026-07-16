@@ -4,52 +4,45 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 )
 
 var (
-	selfIP net.IP
-	mx     sync.Mutex
+	selfIP   net.IP
+	selfOnce sync.Once
 )
 
-// getIfaceIP returns the IP address of the first available network interface that is not loopback.
+// getIfaceIP returns the IPv4 address of the first available network interface
+// that is up and not loopback. Returns nil if none is found.
 func getIfaceIP() net.IP {
-	// Get all network interfaces
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return nil
 	}
 
-	// Iterate through each network interface
 	for _, i := range ifaces {
-		// Skip interfaces that are down or loopback.
 		if i.Flags&net.FlagUp == 0 || i.Flags&net.FlagLoopback != 0 {
 			continue
 		}
 
-		// Get the addresses of the current interface
 		addrs, err := i.Addrs()
 		if err != nil {
 			continue
 		}
 
-		// Iterate through each address
 		for _, a := range addrs {
+			var ip net.IP
 			switch v := a.(type) {
-			// If the address is of type *net.IPAddr
 			case *net.IPAddr:
-				// Skip loopback addresses and addresses that are not IPv4
-				if v.IP.IsLoopback() || v.IP.To4() == nil {
-					continue
-				}
-				return v.IP
-
-			// If the address is of type *net.IPNet
+				ip = v.IP
 			case *net.IPNet:
-				// Skip loopback addresses and addresses that are not IPv4
-				if v.IP.IsLoopback() || v.IP.To4() == nil {
-					continue
-				}
-				return v.IP
+				ip = v.IP
+			}
+			if ip == nil || ip.IsLoopback() {
+				continue
+			}
+			if ip4 := ip.To4(); ip4 != nil {
+				return ip4
 			}
 		}
 	}
@@ -57,9 +50,10 @@ func getIfaceIP() net.IP {
 	return nil
 }
 
-// requestIP requests the local outbound IP address using a UDP dial.
+// requestIP discovers the local outbound IPv4 address by dialing a UDP socket.
+// The dial target is not contacted; the kernel just picks a local source address.
 func requestIP() net.IP {
-	conn, err := net.Dial("udp", "1.1.1.1:80")
+	conn, err := net.DialTimeout("udp", "1.1.1.1:80", 5*time.Second)
 	if err != nil {
 		return nil
 	}
@@ -68,38 +62,22 @@ func requestIP() net.IP {
 	if !ok {
 		return nil
 	}
-	return addr.IP
+	return addr.IP.To4()
 }
 
-// GetSelfIP returns the IP address of the current machine.
+// GetSelfIP returns the IPv4 address of the current machine.
+// The result is computed once and cached for subsequent calls.
 func GetSelfIP() net.IP {
-	// Check if selfIP has already been set
-	if selfIP != nil {
-		// Return the previously set selfIP
-		return selfIP
-	}
-
-	// Lock the mutex
-	mx.Lock()
-	defer mx.Unlock()
-
-	// Another goroutine may have initialized selfIP while we were waiting.
-	if selfIP != nil {
-		return selfIP
-	}
-
-	// Get the IP address using the requestIP function
-	selfIP = requestIP()
-
-	// If the IP address is not available, get it using the getIfaceIP function
-	if selfIP == nil {
-		selfIP = getIfaceIP()
-	}
-
-	// Return the final selfIP
+	selfOnce.Do(func() {
+		selfIP = requestIP()
+		if selfIP == nil {
+			selfIP = getIfaceIP()
+		}
+	})
 	return selfIP
 }
 
+// getInterfaceByIP returns the network interface whose address matches ip.
 func getInterfaceByIP(ip net.IP) (*net.Interface, error) {
 	interfaces, err := net.Interfaces()
 	if err != nil {
@@ -109,7 +87,7 @@ func getInterfaceByIP(ip net.IP) (*net.Interface, error) {
 	for _, iface := range interfaces {
 		addrs, err := iface.Addrs()
 		if err != nil {
-			return nil, err
+			continue
 		}
 
 		for _, addr := range addrs {

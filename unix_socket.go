@@ -66,64 +66,23 @@ func (u *UnixSocket) Close() error {
 	return u.conn.Close()
 }
 
-// NextPacket reads the next packet from the UnixSocket.
-// It returns the packet as a gopacket.Packet and any error encountered.
 func (u *UnixSocket) NextPacket() (gopacket.Packet, *net.IPAddr, error) {
-	// Create a byte slice with the maximum possible length of a packet.
 	packetData := make([]byte, mtu)
 
-	// Read the packet data into the byte slice.
 	n, addr, err := u.Read(packetData)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	// Create a new packet using the packet data and the LinkType of the UnixSocket.
-	// Set the NoCopy option to indicate that the packet should not be copied.
 	packet := gopacket.NewPacket(packetData[:n], u.protocol.LinkType(), gopacket.NoCopy)
 	ipAddr, _ := addr.(*net.IPAddr)
 	return packet, ipAddr, nil
 }
 
-// Iter returns a channel that will receive gopacket.Packet objects.
 func (u *UnixSocket) Iter() chan WrappedPacket {
-	// Create a buffered channel with a capacity of 1024.
 	packets := make(chan WrappedPacket, 1024)
-	// Start a goroutine that will call the startIter method and pass the packets channel.
-	go u.startIter(packets)
-	// Return the packets channel.
+	go packetIter(packets, u.NextPacket)
 	return packets
-}
-
-// startIter starts iterating over packets from the PcapSocket and sends them to the provided channel.
-func (u *UnixSocket) startIter(packets chan WrappedPacket) {
-	for {
-		// Get the next packet from the PcapSocket.
-		packet, addr, err := u.NextPacket()
-		if err != nil {
-			continue
-		}
-
-		// Send the packet to the packets channel.
-		// If the channel was closed by caller, stop the iterator gracefully.
-		func() {
-			defer func() {
-				if recover() != nil {
-					packets = nil
-				}
-			}()
-			if packets == nil {
-				return
-			}
-			packets <- WrappedPacket{
-				IPAddr: addr,
-				Packet: packet,
-			}
-		}()
-		if packets == nil {
-			return
-		}
-	}
 }
 
 func closeOnErr(fd int, err error) (RawSocket, error) {

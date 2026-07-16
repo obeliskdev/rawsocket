@@ -118,6 +118,10 @@ func WithTCPOptions(options ...layers.TCPOption) TCPOpt {
 	return func(t *TCP) { t.Options = append(t.Options, options...) }
 }
 
+func WithTCPLegitOptions(enabled bool) TCPOpt {
+	return func(t *TCP) { t.LegitOptions = enabled }
+}
+
 func WithUDPPayload(payload []byte) UDPOpt {
 	return func(u *UDP) { u.Payload = payload }
 }

@@ -32,16 +32,18 @@ func (udp *UDP) BuildWithError(src, dest net.UDPAddr) ([]byte, error) {
 	}
 	
 	payload := udp.Payload
-	
+
+	var layerBuf [3]gopacket.SerializableLayer
+	layers := layerBuf[:2]
+	layers[0] = serializableIP
+	layers[1] = &scratch.udp
 	if len(payload) > 0 {
-		if err := gopacket.SerializeLayers(scratch.buf, serializeOptions, serializableIP, &scratch.udp, gopacket.Payload(payload)); err != nil {
-			return nil, err
-		}
-	} else {
-		if err := gopacket.SerializeLayers(scratch.buf, serializeOptions, serializableIP, &scratch.udp); err != nil {
-			return nil, err
-		}
+		layers = append(layers, gopacket.Payload(payload))
 	}
-	
+
+	if err := gopacket.SerializeLayers(scratch.buf, serializeOptions, layers...); err != nil {
+		return nil, err
+	}
+
 	return cloneSerializedBytes(scratch.buf), nil
 }

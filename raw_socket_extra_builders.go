@@ -29,21 +29,21 @@ func (igmp *IGMP) BuildWithError(src, dest net.IPAddr) ([]byte, error) {
 	
 	scratch.buf.Clear()
 	_, serializableIP := prepareIPLayers(src.IP, dest.IP, layers.IPProtocolIGMP, &scratch.ip4, &scratch.ip6)
-	
-	payload := make([]byte, 8)
+
+	var payload [8]byte
 	payload[0] = byte(igmp.Type)
 	payload[1] = encodeIGMPMaxResp(igmp.MaxResponseTime)
-	
+
 	group := igmp.GroupAddress.To4()
 	if group == nil {
 		group = net.IPv4zero
 	}
 	copy(payload[4:8], group)
-	
-	csum := checksum16(payload)
+
+	csum := checksum16(payload[:])
 	binary.BigEndian.PutUint16(payload[2:4], csum)
-	
-	if err := gopacket.SerializeLayers(scratch.buf, serializeOptions, serializableIP, gopacket.Payload(payload)); err != nil {
+
+	if err := gopacket.SerializeLayers(scratch.buf, serializeOptions, serializableIP, gopacket.Payload(payload[:])); err != nil {
 		return nil, err
 	}
 	
@@ -62,21 +62,29 @@ func (esp *ESP) Build(src, dest net.IPAddr) []byte {
 func (esp *ESP) BuildWithError(src, dest net.IPAddr) ([]byte, error) {
 	scratch := icmpBuildScratchPool.Get().(*icmpBuildScratch)
 	defer icmpBuildScratchPool.Put(scratch)
-	
+
 	scratch.buf.Clear()
 	_, serializableIP := prepareIPLayers(src.IP, dest.IP, layers.IPProtocolESP, &scratch.ip4, &scratch.ip6)
-	
+
 	payload := esp.Payload
-	
-	espBytes := make([]byte, 8+len(payload))
+	totalLen := 8 + len(payload)
+
+	var espBytes []byte
+	var stackBuf [128]byte
+	if totalLen <= len(stackBuf) {
+		espBytes = stackBuf[:totalLen]
+	} else {
+		espBytes = make([]byte, totalLen)
+	}
+
 	binary.BigEndian.PutUint32(espBytes[0:4], esp.SPI)
 	binary.BigEndian.PutUint32(espBytes[4:8], esp.Sequence)
 	copy(espBytes[8:], payload)
-	
+
 	if err := gopacket.SerializeLayers(scratch.buf, serializeOptions, serializableIP, gopacket.Payload(espBytes)); err != nil {
 		return nil, err
 	}
-	
+
 	return cloneSerializedBytes(scratch.buf), nil
 }
 
@@ -92,22 +100,21 @@ func (r *RawIP) Build(src, dest net.IPAddr) []byte {
 func (r *RawIP) BuildWithError(src, dest net.IPAddr) ([]byte, error) {
 	scratch := icmpBuildScratchPool.Get().(*icmpBuildScratch)
 	defer icmpBuildScratchPool.Put(scratch)
-	
+
 	scratch.buf.Clear()
 	_, serializableIP := prepareIPLayers(src.IP, dest.IP, r.Protocol, &scratch.ip4, &scratch.ip6)
-	
-	payload := r.Payload
-	
-	if len(payload) > 0 {
-		if err := gopacket.SerializeLayers(scratch.buf, serializeOptions, serializableIP, gopacket.Payload(payload)); err != nil {
-			return nil, err
-		}
-	} else {
-		if err := gopacket.SerializeLayers(scratch.buf, serializeOptions, serializableIP); err != nil {
-			return nil, err
-		}
+
+	var layerBuf [2]gopacket.SerializableLayer
+	layers := layerBuf[:1]
+	layers[0] = serializableIP
+	if len(r.Payload) > 0 {
+		layers = append(layers, gopacket.Payload(r.Payload))
 	}
-	
+
+	if err := gopacket.SerializeLayers(scratch.buf, serializeOptions, layers...); err != nil {
+		return nil, err
+	}
+
 	return cloneSerializedBytes(scratch.buf), nil
 }
 

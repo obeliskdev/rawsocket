@@ -21,8 +21,8 @@ func TestUnixSocket_Write(t *testing.T) {
 		return
 	}
 
-	// Create a TCP object with SYN and Randomize set to true.
-	tcp := TCP{SYN: true, Randomize: true}
+	// Create a TCP object with SYN flag set and legit options enabled.
+	tcp := NewTCP(WithTCPSYN(true), WithTCPLegitOptions(true))
 
 	// Create the source TCP address using the GetSelfIP function.
 	src := net.TCPAddr{IP: GetSelfIP()}

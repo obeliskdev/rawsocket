@@ -21,8 +21,8 @@ func TestPcapSocket_Write(t *testing.T) {
 		return
 	}
 
-	// Create a TCP packet with SYN flag set and randomize flag enabled.
-	tcp := TCP{SYN: true, Randomize: true}
+	// Create a TCP packet with SYN flag set and legit options enabled.
+	tcp := NewTCP(WithTCPSYN(true), WithTCPLegitOptions(true))
 
 	// Get the IP address of the current machine.
 	src := net.TCPAddr{IP: GetSelfIP()}

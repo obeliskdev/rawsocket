@@ -10,7 +10,7 @@ import (
 var benchPacket []byte
 
 func BenchmarkUDPBuild(b *testing.B) {
-	udp := &UDP{RandomizedPayloadLength: 64}
+	udp := NewUDP(WithUDPPayload(make([]byte, 64)))
 	src := net.UDPAddr{IP: net.IPv4(192, 168, 1, 10), Port: 12345}
 	dst := net.UDPAddr{IP: net.IPv4(1, 1, 1, 1), Port: 443}
 
@@ -22,10 +22,10 @@ func BenchmarkUDPBuild(b *testing.B) {
 }
 
 func BenchmarkICMPBuild(b *testing.B) {
-	icmp := &ICMP{
-		Type:                    layers.CreateICMPv4TypeCode(layers.ICMPv4TypeEchoRequest, 0),
-		RandomizedPayloadLength: 56,
-	}
+	icmp := NewICMP(
+		WithICMPType(layers.CreateICMPv4TypeCode(layers.ICMPv4TypeEchoRequest, 0)),
+		WithICMPPayload(make([]byte, 56)),
+	)
 	src := net.IPAddr{IP: net.IPv4(192, 168, 1, 10)}
 	dst := net.IPAddr{IP: net.IPv4(8, 8, 8, 8)}
 
@@ -37,11 +37,7 @@ func BenchmarkICMPBuild(b *testing.B) {
 }
 
 func BenchmarkTCPBuildSYN(b *testing.B) {
-	tcp := &TCP{
-		SYN:                     true,
-		Randomize:               true,
-		RandomizedPayloadLength: 0,
-	}
+	tcp := NewTCP(WithTCPSYN(true))
 	src := net.TCPAddr{IP: net.IPv4(192, 168, 1, 10), Port: 49152}
 	dst := net.TCPAddr{IP: net.IPv4(104, 16, 132, 229), Port: 443}
 
@@ -71,7 +67,7 @@ func BenchmarkESPBuild(b *testing.B) {
 	esp := NewESP(
 		WithESPSPI(1),
 		WithESPSequence(1),
-		WithESPRandomPayload(64),
+		WithESPPayload(make([]byte, 64)),
 	)
 	src := net.IPAddr{IP: net.IPv4(192, 168, 1, 10)}
 	dst := net.IPAddr{IP: net.IPv4(1, 1, 1, 1)}
@@ -86,7 +82,7 @@ func BenchmarkESPBuild(b *testing.B) {
 func BenchmarkRawIPBuild(b *testing.B) {
 	raw := NewRawIP(
 		WithRawIPProtocol(layers.IPProtocol(253)),
-		WithRawIPRandomPayload(64),
+		WithRawIPPayload(make([]byte, 64)),
 	)
 	src := net.IPAddr{IP: net.IPv4(192, 168, 1, 10)}
 	dst := net.IPAddr{IP: net.IPv4(1, 1, 1, 1)}
