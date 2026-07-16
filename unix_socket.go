@@ -3,6 +3,7 @@
 package rawsocket
 
 import (
+	"errors"
 	"math"
 
 	"github.com/google/gopacket"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"strconv"
 	"syscall"
+	"time"
 )
 
 //goland:noinspection GoUnusedGlobalVariable,GoSnakeCaseUsage
@@ -60,6 +62,14 @@ func (u *UnixSocket) Read(bytes []byte) (int, net.Addr, error) {
 	return u.conn.ReadFrom(bytes)
 }
 
+// SetReadDeadline sets the deadline for future Read calls on the
+// underlying net.PacketConn. A zero value means no deadline. This
+// lets callers poll with a short deadline to break out of a blocking
+// Read on context cancellation.
+func (u *UnixSocket) SetReadDeadline(t time.Time) error {
+	return u.conn.SetReadDeadline(t)
+}
+
 // Close closes the UnixSocket connection.
 // It returns an error if there was an issue closing the connection.
 func (u *UnixSocket) Close() error {
@@ -83,6 +93,28 @@ func (u *UnixSocket) Iter() chan WrappedPacket {
 	packets := make(chan WrappedPacket, 1024)
 	go packetIter(packets, u.NextPacket)
 	return packets
+}
+
+// WriteRaw writes a pre-formatted IP packet directly to the wire.
+// The destination address is extracted from the IP header in the
+// packet so the kernel knows where to route it.
+func (u *UnixSocket) WriteRaw(bytes []byte) (int, error) {
+	dst := extractDstIP(bytes)
+	if dst == nil {
+		return 0, errors.New("rawsocket: cannot extract destination IP from packet")
+	}
+	return u.conn.WriteTo(bytes, &net.IPAddr{IP: dst})
+}
+
+// IsRawMode returns true — Unix raw sockets always operate in IP-raw
+// mode (no ethernet framing needed).
+func (u *UnixSocket) IsRawMode() bool {
+	return true
+}
+
+// MACs returns nil, nil — Unix raw sockets do not use ethernet framing.
+func (u *UnixSocket) MACs() (src, dst net.HardwareAddr) {
+	return nil, nil
 }
 
 func closeOnErr(fd int, err error) (RawSocket, error) {

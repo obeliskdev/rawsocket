@@ -21,7 +21,7 @@ func (udp *UDP) BuildWithError(src, dest net.UDPAddr) ([]byte, error) {
 	defer udpBuildScratchPool.Put(scratch)
 
 	scratch.buf.Clear()
-	networkLayer, serializableIP := prepareIPLayers(src.IP, dest.IP, layers.IPProtocolUDP, &scratch.ip4, &scratch.ip6)
+	networkLayer, serializableIP, _ := prepareIPLayers(src.IP, dest.IP, layers.IPProtocolUDP, &scratch.ip4, &scratch.ip6)
 
 	scratch.udp = layers.UDP{
 		SrcPort: layers.UDPPort(validPort(src.Port)),

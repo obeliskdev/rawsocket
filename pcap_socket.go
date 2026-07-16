@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
@@ -98,23 +99,45 @@ func waitForMac(packetSource *gopacket.PacketSource) {
 
 type PcapSocket struct {
 	*pcap.Handle
-	isRaw    bool
-	protocol ProtocolType
-	source   *gopacket.PacketSource
+	isRaw      bool
+	protocol   ProtocolType
+	source     *gopacket.PacketSource
+	filterType gopacket.LayerType
+
+	readDeadlineMu sync.Mutex
+	readDeadline   time.Time // zero = no deadline (block until packet)
 }
 
 func newPcapSocket(isRaw bool, handle *pcap.Handle, protocol ProtocolType, source *gopacket.PacketSource) *PcapSocket {
 	return &PcapSocket{
-		isRaw:    isRaw,
-		Handle:   handle,
-		protocol: protocol,
-		source:   source,
+		isRaw:      isRaw,
+		Handle:     handle,
+		protocol:   protocol,
+		source:     source,
+		filterType: protocolFilterType(protocol),
+	}
+}
+
+func protocolFilterType(p ProtocolType) gopacket.LayerType {
+	switch p {
+	case IPPROTO_TCP:
+		return layers.LayerTypeTCP
+	case IPPROTO_UDP:
+		return layers.LayerTypeUDP
+	case IPPROTO_IGMP:
+		return layers.LayerTypeIGMP
+	case IPPROTO_ESP:
+		return layers.LayerTypeIPSecESP
+	default:
+		return gopacket.LayerTypeZero
 	}
 }
 
 var writeBufPool = sync.Pool{
 	New: func() any { return gopacket.NewSerializeBuffer() },
 }
+
+var broadcastMAC = net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
 
 func (p *PcapSocket) Write(bytes []byte, addr net.Addr) (int, error) {
 	if addr == nil {
@@ -179,6 +202,36 @@ func (p *PcapSocket) Write(bytes []byte, addr net.Addr) (int, error) {
 	return len(bytes), nil
 }
 
+// WriteRaw writes a pre-formatted frame directly to the wire via
+// WritePacketData, bypassing gopacket re-parsing and re-serialization.
+// The caller must include any required headers (ethernet, IP, transport).
+func (p *PcapSocket) WriteRaw(bytes []byte) (int, error) {
+	if err := p.WritePacketData(bytes); err != nil {
+		return 0, err
+	}
+	return len(bytes), nil
+}
+
+// IsRawMode returns true when the socket operates in IP-raw mode
+// (no ethernet framing needed).
+func (p *PcapSocket) IsRawMode() bool {
+	return p.isRaw
+}
+
+// MACs returns the source and router MAC addresses used for ethernet
+// framing. Returns nil, nil in raw mode or when MACs are unavailable.
+func (p *PcapSocket) MACs() (src, dst net.HardwareAddr) {
+	mutex.RLock()
+	if SysSrcMac != nil {
+		src = *SysSrcMac
+	}
+	if RouterMac != nil {
+		dst = *RouterMac
+	}
+	mutex.RUnlock()
+	return
+}
+
 func createPacket(bytes []byte) gopacket.Packet {
 	if isIPv4(bytes) {
 		return gopacket.NewPacket(bytes, layers.LayerTypeIPv4, decodeOptions)
@@ -210,43 +263,58 @@ func getNetworkAndTransportLayers(packet gopacket.Packet) (gopacket.Serializable
 
 func (p *PcapSocket) NextPacket() (gopacket.Packet, *net.IPAddr, error) {
 	for {
+		// Check the caller-imposed deadline. The handle's own read
+		// timeout (250 ms) makes ReadPacketData return periodically;
+		// we retry until the deadline expires or a packet arrives.
+		p.readDeadlineMu.Lock()
+		dl := p.readDeadline
+		p.readDeadlineMu.Unlock()
+		if !dl.IsZero() && time.Now().After(dl) {
+			return nil, nil, errReadTimeout
+		}
+
 		packet, err := p.source.NextPacket()
 		if err != nil {
+			// A timeout from the handle's finite read timeout is
+			// expected while polling; retry unless the caller's
+			// deadline has passed.
+			if isPcapTimeout(err) {
+				if !dl.IsZero() && time.Now().After(dl) {
+					return nil, nil, errReadTimeout
+				}
+				continue
+			}
 			return nil, nil, err
 		}
 
 		var ipAddr net.IP
+		var isV4 bool
 
 		if ip4Layer := packet.Layer(layers.LayerTypeIPv4); ip4Layer != nil {
 			ipAddr = ip4Layer.(*layers.IPv4).SrcIP
+			isV4 = true
 		} else if ip6Layer := packet.Layer(layers.LayerTypeIPv6); ip6Layer != nil {
 			ipAddr = ip6Layer.(*layers.IPv6).SrcIP
 		}
 
 		switch p.protocol {
-		case IPPROTO_TCP:
-			if packet.Layer(layers.LayerTypeTCP) == nil {
-				continue
-			}
-		case IPPROTO_UDP:
-			if packet.Layer(layers.LayerTypeUDP) == nil {
+		case IPPROTO_TCP, IPPROTO_UDP, IPPROTO_IGMP, IPPROTO_ESP:
+			if packet.Layer(p.filterType) == nil {
 				continue
 			}
 		case IPPROTO_IP:
-			if packet.Layer(layers.LayerTypeIPv4) == nil && packet.Layer(layers.LayerTypeIPv6) == nil {
+			if ipAddr == nil {
 				continue
 			}
 		case IPPROTO_ICMP:
-			if packet.Layer(layers.LayerTypeICMPv4) == nil && packet.Layer(layers.LayerTypeICMPv6) == nil {
-				continue
-			}
-		case IPPROTO_IGMP:
-			if packet.Layer(layers.LayerTypeIGMP) == nil {
-				continue
-			}
-		case IPPROTO_ESP:
-			if packet.Layer(layers.LayerTypeIPSecESP) == nil {
-				continue
+			if isV4 {
+				if packet.Layer(layers.LayerTypeICMPv4) == nil {
+					continue
+				}
+			} else {
+				if packet.Layer(layers.LayerTypeICMPv6) == nil {
+					continue
+				}
 			}
 		default:
 			if p.protocol != IPPROTO_RAW {
@@ -264,6 +332,32 @@ func (p *PcapSocket) Iter() chan WrappedPacket {
 	return packets
 }
 
+// SetReadDeadline sets the deadline for future Read/NextPacket calls.
+// A zero value means no deadline (block until a packet arrives).
+// Since the underlying pcap handle has no native SetReadDeadline, the
+// deadline is stored and checked in the NextPacket retry loop. The
+// handle is opened with a 250 ms read timeout so the loop wakes up
+// regularly to check the deadline.
+func (p *PcapSocket) SetReadDeadline(t time.Time) error {
+	p.readDeadlineMu.Lock()
+	p.readDeadline = t
+	p.readDeadlineMu.Unlock()
+	return nil
+}
+
+var errReadTimeout = errors.New("rawsocket: read deadline exceeded")
+
+// isPcapTimeout reports whether err is a pcap read timeout. gopacket
+// returns NextErrorTimeoutExpired when the handle's read timeout
+// elapses without a packet.
+func isPcapTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "timeout") || strings.Contains(s, "Timeout")
+}
+
 func (p *PcapSocket) Read(bytes []byte) (int, net.Addr, error) {
 	for {
 		packet, addr, err := p.NextPacket()
@@ -274,38 +368,26 @@ func (p *PcapSocket) Read(bytes []byte) (int, net.Addr, error) {
 		switch p.protocol {
 		case IPPROTO_UDP, IPPROTO_TCP:
 			if transportLayer := packet.TransportLayer(); transportLayer != nil {
-				n := copy(bytes, transportLayer.LayerContents())
-				n += copy(bytes[n:], transportLayer.LayerPayload())
-				return n, addr, nil
+				return copyLayerData(bytes, transportLayer), addr, nil
 			}
-		case IPPROTO_IP:
+		case IPPROTO_IP, IPPROTO_ICMP:
 			if networkLayer := packet.NetworkLayer(); networkLayer != nil {
-				n := copy(bytes, networkLayer.LayerContents())
-				n += copy(bytes[n:], networkLayer.LayerPayload())
-				return n, addr, nil
+				return copyLayerData(bytes, networkLayer), addr, nil
 			}
-		case IPPROTO_ICMP:
-			if networkLayer := packet.NetworkLayer(); networkLayer != nil {
-				n := copy(bytes, networkLayer.LayerContents())
-				n += copy(bytes[n:], networkLayer.LayerPayload())
-				return n, addr, nil
-			}
-		case IPPROTO_IGMP:
-			if igmpLayer := packet.Layer(layers.LayerTypeIGMP); igmpLayer != nil {
-				n := copy(bytes, igmpLayer.LayerContents())
-				n += copy(bytes[n:], igmpLayer.LayerPayload())
-				return n, addr, nil
-			}
-		case IPPROTO_ESP:
-			if espLayer := packet.Layer(layers.LayerTypeIPSecESP); espLayer != nil {
-				n := copy(bytes, espLayer.LayerContents())
-				n += copy(bytes[n:], espLayer.LayerPayload())
-				return n, addr, nil
+		case IPPROTO_IGMP, IPPROTO_ESP:
+			if layer := packet.Layer(p.filterType); layer != nil {
+				return copyLayerData(bytes, layer), addr, nil
 			}
 		default:
 			return copy(bytes, packet.Data()), addr, nil
 		}
 	}
+}
+
+func copyLayerData(dst []byte, layer gopacket.Layer) int {
+	n := copy(dst, layer.LayerContents())
+	n += copy(dst[n:], layer.LayerPayload())
+	return n
 }
 
 func (p *PcapSocket) Close() error {
@@ -321,7 +403,12 @@ func OpenRawSocket(protocol ProtocolType) (RawSocket, error) {
 		return nil, errors.New("network device not found")
 	}
 
-	handle, err := pcap.OpenLive(device.Name, 255, true, pcap.BlockForever)
+	// Use a finite read timeout so SetReadDeadline polling works:
+	// ReadPacketData returns a timeout error after this interval,
+	// letting NextPacket/Read retry until the caller's deadline
+	// expires or ctx is cancelled. BlockForever would never return,
+	// making the socket uncancellable.
+	handle, err := pcap.OpenLive(device.Name, 255, true, 250*time.Millisecond)
 	if err != nil {
 		return nil, err
 	}
@@ -378,13 +465,13 @@ func updateMac(handle *pcap.Handle) error {
 		Operation:         layers.ARPRequest,
 		SourceHwAddress:   localMAC,
 		SourceProtAddress: GetSelfIP(),
-		DstHwAddress:      net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
+		DstHwAddress:      broadcastMAC,
 		DstProtAddress:    GetSelfIP(),
 	}
 
 	ethernetPacket := &layers.Ethernet{
 		SrcMAC:       localMAC,
-		DstMAC:       net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
+		DstMAC:       broadcastMAC,
 		EthernetType: layers.EthernetTypeARP,
 	}
 
@@ -403,37 +490,13 @@ func updateMac(handle *pcap.Handle) error {
 }
 
 func GetLocalMac() (net.HardwareAddr, error) {
-	interfaces, err := net.Interfaces()
-	if err != nil {
-		return nil, err
-	}
-
 	selfIP := GetSelfIP()
 
-	for _, iface := range interfaces {
-		addrs, err := iface.Addrs()
-		if err != nil {
-			continue
-		}
-
-		for _, addr := range addrs {
-			if isSameIP(addr, selfIP) {
-				return iface.HardwareAddr, nil
-			}
-		}
+	iface, ok := findIfaceForIP(selfIP)
+	if !ok {
+		return nil, fmt.Errorf("failed to retrieve local MAC address")
 	}
-
-	return nil, fmt.Errorf("failed to retrieve local MAC address")
-}
-
-func isSameIP(addr net.Addr, selfIP net.IP) bool {
-	switch v := addr.(type) {
-	case *net.IPAddr:
-		return v.IP.Equal(selfIP)
-	case *net.IPNet:
-		return v.IP.Equal(selfIP)
-	}
-	return false
+	return iface.HardwareAddr, nil
 }
 
 func hasEthernet(bytes []byte) bool {

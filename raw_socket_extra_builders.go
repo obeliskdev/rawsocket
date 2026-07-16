@@ -20,15 +20,14 @@ func (igmp *IGMP) Build(src, dest net.IPAddr) []byte {
 }
 
 func (igmp *IGMP) BuildWithError(src, dest net.IPAddr) ([]byte, error) {
-	if src.IP.To4() == nil || dest.IP.To4() == nil {
-		return nil, errors.New("igmp builder currently supports ipv4 only")
-	}
-
 	scratch := icmpBuildScratchPool.Get().(*icmpBuildScratch)
 	defer icmpBuildScratchPool.Put(scratch)
 
 	scratch.buf.Clear()
-	_, serializableIP := prepareIPLayers(src.IP, dest.IP, layers.IPProtocolIGMP, &scratch.ip4, &scratch.ip6)
+	_, serializableIP, isV4 := prepareIPLayers(src.IP, dest.IP, layers.IPProtocolIGMP, &scratch.ip4, &scratch.ip6)
+	if !isV4 {
+		return nil, errors.New("igmp builder currently supports ipv4 only")
+	}
 
 	var payload [8]byte
 	payload[0] = byte(igmp.Type)
@@ -64,7 +63,7 @@ func (esp *ESP) BuildWithError(src, dest net.IPAddr) ([]byte, error) {
 	defer icmpBuildScratchPool.Put(scratch)
 
 	scratch.buf.Clear()
-	_, serializableIP := prepareIPLayers(src.IP, dest.IP, layers.IPProtocolESP, &scratch.ip4, &scratch.ip6)
+	_, serializableIP, _ := prepareIPLayers(src.IP, dest.IP, layers.IPProtocolESP, &scratch.ip4, &scratch.ip6)
 
 	payload := esp.Payload
 	totalLen := 8 + len(payload)
@@ -102,7 +101,7 @@ func (r *RawIP) BuildWithError(src, dest net.IPAddr) ([]byte, error) {
 	defer icmpBuildScratchPool.Put(scratch)
 
 	scratch.buf.Clear()
-	_, serializableIP := prepareIPLayers(src.IP, dest.IP, r.Protocol, &scratch.ip4, &scratch.ip6)
+	_, serializableIP, _ := prepareIPLayers(src.IP, dest.IP, r.Protocol, &scratch.ip4, &scratch.ip6)
 
 	var layerBuf [2]gopacket.SerializableLayer
 	layers := layerBuf[:1]
@@ -131,11 +130,12 @@ func encodeIGMPMaxResp(d time.Duration) byte {
 
 func checksum16(b []byte) uint16 {
 	var sum uint32
-	for i := 0; i+1 < len(b); i += 2 {
+	n := len(b) &^ 1
+	for i := 0; i < n; i += 2 {
 		sum += uint32(binary.BigEndian.Uint16(b[i : i+2]))
 	}
-	if len(b)%2 != 0 {
-		sum += uint32(b[len(b)-1]) << 8
+	if len(b)&1 != 0 {
+		sum += uint32(b[n]) << 8
 	}
 	for (sum >> 16) != 0 {
 		sum = (sum & 0xffff) + (sum >> 16)

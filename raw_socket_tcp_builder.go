@@ -22,7 +22,7 @@ func (tcp *TCP) BuildWithError(src, dest net.TCPAddr) ([]byte, error) {
 	defer tcpBuildScratchPool.Put(scratch)
 
 	scratch.buf.Clear()
-	networkLayer, serializableIP := prepareIPLayers(src.IP, dest.IP, layers.IPProtocolTCP, &scratch.ip4, &scratch.ip6)
+	networkLayer, serializableIP, _ := prepareIPLayers(src.IP, dest.IP, layers.IPProtocolTCP, &scratch.ip4, &scratch.ip6)
 
 	scratch.tcp = layers.TCP{
 		SrcPort: layers.TCPPort(validPort(src.Port)),

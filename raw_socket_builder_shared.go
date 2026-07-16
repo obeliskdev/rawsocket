@@ -76,7 +76,7 @@ func fillTimestamp(dst []byte) {
 	binary.BigEndian.PutUint32(dst[4:], fastrand.Number[uint32](0, ^uint32(0)))
 }
 
-func prepareIPLayers(src, dest net.IP, protocol layers.IPProtocol, ip4 *layers.IPv4, ip6 *layers.IPv6) (gopacket.NetworkLayer, gopacket.SerializableLayer) {
+func prepareIPLayers(src, dest net.IP, protocol layers.IPProtocol, ip4 *layers.IPv4, ip6 *layers.IPv6) (gopacket.NetworkLayer, gopacket.SerializableLayer, bool) {
 	src4 := src.To4()
 	dest4 := dest.To4()
 	if src4 != nil && dest4 != nil {
@@ -89,7 +89,7 @@ func prepareIPLayers(src, dest net.IP, protocol layers.IPProtocol, ip4 *layers.I
 			SrcIP:    src4,
 			DstIP:    dest4,
 		}
-		return ip4, ip4
+		return ip4, ip4, true
 	}
 
 	*ip6 = layers.IPv6{
@@ -98,5 +98,5 @@ func prepareIPLayers(src, dest net.IP, protocol layers.IPProtocol, ip4 *layers.I
 		SrcIP:      src,
 		DstIP:      dest,
 	}
-	return ip6, ip6
+	return ip6, ip6, false
 }

@@ -34,10 +34,9 @@ func parseData(data []string) []netContainer {
 	containers := make([]netContainer, 0, len(data))
 
 	for _, x := range data {
-		if strings.ContainsRune(x, '-') {
-			n := strings.SplitN(x, "-", 2)
-			start := net.ParseIP(n[0])
-			end := net.ParseIP(n[1])
+		if dashIdx := strings.IndexByte(x, '-'); dashIdx >= 0 {
+			start := net.ParseIP(x[:dashIdx])
+			end := net.ParseIP(x[dashIdx+1:])
 			if start == nil || end == nil {
 				continue
 			}
@@ -48,7 +47,7 @@ func parseData(data []string) []netContainer {
 			continue
 		}
 
-		if strings.ContainsRune(x, '/') {
+		if slashIdx := strings.IndexByte(x, '/'); slashIdx >= 0 {
 			start, end, err := cidrStartEnd(x)
 			if err != nil {
 				continue
@@ -128,9 +127,10 @@ func (it *IPIterator) advanceToNextContainer(idx int) net.IP {
 		return nil
 	}
 	it.currentIdx = idx
-	it.setCurrentIP(it.currentContainer().start)
+	cont := it.currentContainer()
+	it.setCurrentIP(cont.start)
 	if it.skipLocal && it.isLocalAddress() {
-		return it.skipLocalAddresses(it.currentContainer())
+		return it.skipLocalAddresses(cont)
 	}
 	return it.currentIP
 }
@@ -146,7 +146,7 @@ func (it *IPIterator) currentContainer() netContainer {
 }
 
 func (it *IPIterator) atEndOfContainer(cont netContainer) bool {
-	return it.currentIP.Equal(cont.end)
+	return ipBytesEqual(it.currentIP, cont.end)
 }
 
 // incrementIP increments currentIP in place, avoiding allocation.
@@ -173,10 +173,60 @@ func (it *IPIterator) skipLocalAddresses(cont netContainer) net.IP {
 
 // isLocalAddress checks if the current IP address is a local address.
 func (it *IPIterator) isLocalAddress() bool {
-	if len(it.currentIP) == 0 {
+	ip := it.currentIP
+	switch len(ip) {
+	case 0:
+		return false
+	case 4:
+		return isLocalV4(ip)
+	case 16:
+		if ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] == 0 &&
+			ip[4] == 0 && ip[5] == 0 && ip[6] == 0 && ip[7] == 0 &&
+			ip[8] == 0 && ip[9] == 0 && ip[10] == 0xff && ip[11] == 0xff {
+			return isLocalV4(ip[12:16])
+		}
+		return isLocalV6(ip)
+	default:
 		return false
 	}
-	return it.currentIP.IsUnspecified() || it.currentIP.IsLoopback() || it.currentIP.IsPrivate()
+}
+
+func isLocalV4(ip []byte) bool {
+	return ip[0] == 0 ||
+		ip[0] == 127 ||
+		ip[0] == 10 ||
+		(ip[0] == 172 && ip[1] >= 16 && ip[1] <= 31) ||
+		(ip[0] == 192 && ip[1] == 168)
+}
+
+func isLocalV6(ip []byte) bool {
+	nonZeroIdx := -1
+	for i, b := range ip {
+		if b != 0 {
+			nonZeroIdx = i
+			break
+		}
+	}
+	if nonZeroIdx == -1 {
+		return true
+	}
+	if nonZeroIdx == 15 && ip[15] == 1 {
+		return true
+	}
+	return ip[0]&0xfe == 0xfc
+}
+
+// ipBytesEqual compares two net.IP values by raw bytes without To4() allocation.
+func ipBytesEqual(a, b net.IP) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // ipLessOrEqual checks if IP address ip is less than or equal to IP address ip2.
@@ -207,7 +257,7 @@ func (it *IPIterator) HasNext() bool {
 
 	container := it.currentContainer()
 
-	if it.currentIP.Equal(container.end) {
+	if ipBytesEqual(it.currentIP, container.end) {
 		return it.currentIdx+1 < len(it.containers)
 	}
 

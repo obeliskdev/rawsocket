@@ -8,9 +8,21 @@ import (
 )
 
 var (
-	selfIP   net.IP
-	selfOnce sync.Once
+	selfIP     net.IP
+	selfIPIsV4 bool
+	selfOnce   sync.Once
 )
+
+// addrIP extracts the net.IP from a net.Addr, or nil if the type is unknown.
+func addrIP(a net.Addr) net.IP {
+	switch v := a.(type) {
+	case *net.IPAddr:
+		return v.IP
+	case *net.IPNet:
+		return v.IP
+	}
+	return nil
+}
 
 // getIfaceIP returns the IPv4 address of the first available network interface
 // that is up and not loopback. Returns nil if none is found.
@@ -31,13 +43,7 @@ func getIfaceIP() net.IP {
 		}
 
 		for _, a := range addrs {
-			var ip net.IP
-			switch v := a.(type) {
-			case *net.IPAddr:
-				ip = v.IP
-			case *net.IPNet:
-				ip = v.IP
-			}
+			ip := addrIP(a)
 			if ip == nil || ip.IsLoopback() {
 				continue
 			}
@@ -73,15 +79,19 @@ func GetSelfIP() net.IP {
 		if selfIP == nil {
 			selfIP = getIfaceIP()
 		}
+		if selfIP != nil {
+			selfIPIsV4 = selfIP.To4() != nil
+		}
 	})
 	return selfIP
 }
 
-// getInterfaceByIP returns the network interface whose address matches ip.
-func getInterfaceByIP(ip net.IP) (*net.Interface, error) {
+// findIfaceForIP returns the first network interface whose address matches ip.
+// The addr type-switch is shared by getInterfaceByIP and GetLocalMac.
+func findIfaceForIP(ip net.IP) (*net.Interface, bool) {
 	interfaces, err := net.Interfaces()
 	if err != nil {
-		return nil, err
+		return nil, false
 	}
 
 	for _, iface := range interfaces {
@@ -91,11 +101,20 @@ func getInterfaceByIP(ip net.IP) (*net.Interface, error) {
 		}
 
 		for _, addr := range addrs {
-			if ipnet, ok := addr.(*net.IPNet); ok && ipnet.IP.Equal(ip) {
-				return &iface, nil
+			if addrIP(addr).Equal(ip) {
+				return &iface, true
 			}
 		}
 	}
 
-	return nil, fmt.Errorf("no interface found for IP address: %s", ip)
+	return nil, false
+}
+
+// getInterfaceByIP returns the network interface whose address matches ip.
+func getInterfaceByIP(ip net.IP) (*net.Interface, error) {
+	iface, ok := findIfaceForIP(ip)
+	if !ok {
+		return nil, fmt.Errorf("no interface found for IP address: %s", ip)
+	}
+	return iface, nil
 }

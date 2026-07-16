@@ -16,8 +16,7 @@ func (t ProtocolType) LinkType() gopacket.Decoder {
 	case IPPROTO_UDP:
 		return layers.LayerTypeUDP
 	case IPPROTO_ICMP:
-		ip := GetSelfIP()
-		if ip.To4() != nil {
+		if selfIPIsV4 {
 			return layers.LayerTypeICMPv4
 		}
 		return layers.LayerTypeICMPv6
@@ -28,8 +27,7 @@ func (t ProtocolType) LinkType() gopacket.Decoder {
 	case IPPROTO_TCP:
 		return layers.LayerTypeTCP
 	case IPPROTO_IP, IPPROTO_RAW:
-		ip := GetSelfIP()
-		if ip.To4() != nil {
+		if selfIPIsV4 {
 			return layers.LayerTypeIPv4
 		}
 		return layers.LayerTypeIPv6
@@ -82,7 +80,26 @@ type WrappedPacket struct {
 type RawSocket interface {
 	Write([]byte, net.Addr) (int, error)
 	Read([]byte) (int, net.Addr, error)
+	// SetReadDeadline sets the deadline for future Read calls. A
+	// zero value means no deadline. Returns an error if deadlines
+	// are not supported. Lets callers break out of a blocking Read
+	// on context cancellation without spawning a goroutine per
+	// packet or closing the socket.
+	SetReadDeadline(t time.Time) error
 	NextPacket() (gopacket.Packet, *net.IPAddr, error)
 	Iter() chan WrappedPacket
 	Close() error
+	// WriteRaw writes a pre-formatted frame directly to the wire
+	// without any gopacket re-parsing or re-serialization. The
+	// caller is responsible for including any required headers
+	// (ethernet, IP, transport). Returns the number of bytes written.
+	WriteRaw([]byte) (int, error)
+	// IsRawMode returns true when the socket operates in IP-raw mode
+	// (no ethernet framing needed). Returns false when ethernet
+	// framing is required (e.g. Windows pcap non-raw mode).
+	IsRawMode() bool
+	// MACs returns the source and router MAC addresses used for
+	// ethernet framing. Returns nil, nil in raw mode or when MACs
+	// are not available.
+	MACs() (src, dst net.HardwareAddr)
 }

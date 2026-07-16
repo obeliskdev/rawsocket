@@ -209,7 +209,7 @@ func TestPrepareIPLayers_Allocation(t *testing.T) {
 	var ip6 layers.IPv6
 
 	allocs := testing.AllocsPerRun(100, func() {
-		prepareIPLayers(src, dst, layers.IPProtocolTCP, &ip4, &ip6)
+		_, _, _ = prepareIPLayers(src, dst, layers.IPProtocolTCP, &ip4, &ip6)
 	})
 	if allocs != 0 {
 		t.Fatalf("expected 0 allocs for prepareIPLayers IPv4, got %v", allocs)
