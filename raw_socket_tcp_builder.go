@@ -2,7 +2,7 @@ package rawsocket
 
 import (
 	"net"
-	
+
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/obeliskdev/fastrand"
@@ -20,10 +20,10 @@ func (tcp *TCP) Build(src, dest net.TCPAddr) []byte {
 func (tcp *TCP) BuildWithError(src, dest net.TCPAddr) ([]byte, error) {
 	scratch := tcpBuildScratchPool.Get().(*tcpBuildScratch)
 	defer tcpBuildScratchPool.Put(scratch)
-	
+
 	scratch.buf.Clear()
 	networkLayer, serializableIP := prepareIPLayers(src.IP, dest.IP, layers.IPProtocolTCP, &scratch.ip4, &scratch.ip6)
-	
+
 	scratch.tcp = layers.TCP{
 		SrcPort: layers.TCPPort(validPort(src.Port)),
 		DstPort: layers.TCPPort(validPort(dest.Port)),
@@ -43,7 +43,7 @@ func (tcp *TCP) BuildWithError(src, dest net.TCPAddr) ([]byte, error) {
 	if scratch.tcp.Window == 0 {
 		scratch.tcp.Window = 65535
 	}
-	
+
 	optionCap := len(tcp.Options)
 	switch {
 	case tcp.ACK && tcp.SYN:
@@ -60,7 +60,7 @@ func (tcp *TCP) BuildWithError(src, dest net.TCPAddr) ([]byte, error) {
 	} else {
 		scratch.tcp.Options = make([]layers.TCPOption, 0, optionCap)
 	}
-	
+
 	if tcp.LegitOptions {
 		if tcp.ACK && tcp.SYN {
 			scratch.tcp.Options = append(scratch.tcp.Options,
@@ -88,15 +88,15 @@ func (tcp *TCP) BuildWithError(src, dest net.TCPAddr) ([]byte, error) {
 			)
 		}
 	}
-	
+
 	if len(tcp.Options) > 0 {
 		scratch.tcp.Options = append(scratch.tcp.Options, tcp.Options...)
 	}
-	
+
 	if err := scratch.tcp.SetNetworkLayerForChecksum(networkLayer); err != nil {
 		return nil, err
 	}
-	
+
 	payload := tcp.Payload
 
 	var layerBuf [3]gopacket.SerializableLayer

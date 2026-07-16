@@ -3,7 +3,7 @@ package rawsocket
 import (
 	"net"
 	"time"
-	
+
 	"github.com/google/gopacket/layers"
 )
 

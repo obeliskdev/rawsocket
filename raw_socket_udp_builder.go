@@ -2,7 +2,7 @@ package rawsocket
 
 import (
 	"net"
-	
+
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 )
@@ -19,10 +19,10 @@ func (udp *UDP) Build(src, dest net.UDPAddr) []byte {
 func (udp *UDP) BuildWithError(src, dest net.UDPAddr) ([]byte, error) {
 	scratch := udpBuildScratchPool.Get().(*udpBuildScratch)
 	defer udpBuildScratchPool.Put(scratch)
-	
+
 	scratch.buf.Clear()
 	networkLayer, serializableIP := prepareIPLayers(src.IP, dest.IP, layers.IPProtocolUDP, &scratch.ip4, &scratch.ip6)
-	
+
 	scratch.udp = layers.UDP{
 		SrcPort: layers.UDPPort(validPort(src.Port)),
 		DstPort: layers.UDPPort(validPort(dest.Port)),
@@ -30,7 +30,7 @@ func (udp *UDP) BuildWithError(src, dest net.UDPAddr) ([]byte, error) {
 	if err := scratch.udp.SetNetworkLayerForChecksum(networkLayer); err != nil {
 		return nil, err
 	}
-	
+
 	payload := udp.Payload
 
 	var layerBuf [3]gopacket.SerializableLayer

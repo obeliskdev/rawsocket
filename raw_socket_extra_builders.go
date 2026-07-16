@@ -5,7 +5,7 @@ import (
 	"errors"
 	"net"
 	"time"
-	
+
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 )
@@ -23,10 +23,10 @@ func (igmp *IGMP) BuildWithError(src, dest net.IPAddr) ([]byte, error) {
 	if src.IP.To4() == nil || dest.IP.To4() == nil {
 		return nil, errors.New("igmp builder currently supports ipv4 only")
 	}
-	
+
 	scratch := icmpBuildScratchPool.Get().(*icmpBuildScratch)
 	defer icmpBuildScratchPool.Put(scratch)
-	
+
 	scratch.buf.Clear()
 	_, serializableIP := prepareIPLayers(src.IP, dest.IP, layers.IPProtocolIGMP, &scratch.ip4, &scratch.ip6)
 
@@ -46,7 +46,7 @@ func (igmp *IGMP) BuildWithError(src, dest net.IPAddr) ([]byte, error) {
 	if err := gopacket.SerializeLayers(scratch.buf, serializeOptions, serializableIP, gopacket.Payload(payload[:])); err != nil {
 		return nil, err
 	}
-	
+
 	return cloneSerializedBytes(scratch.buf), nil
 }
 
