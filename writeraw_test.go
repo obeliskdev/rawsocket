@@ -96,3 +96,71 @@ func TestExtractDstIP(t *testing.T) {
 		t.Errorf("extractDstIP on short IPv6 packet should return nil, got %v", dst)
 	}
 }
+
+// TestExtractDstIP_NoAliasing verifies that extractDstIP returns a
+// copy, not a slice into the original packet buffer. This is critical
+// because callers like monoamp's packetBuilder reuse the buffer on the
+// next call — an aliased dst IP would become garbage before WriteTo
+// consumes it.
+func TestExtractDstIP_NoAliasing(t *testing.T) {
+	pkt := make([]byte, 28)
+	pkt[0] = 0x45
+	copy(pkt[16:20], net.IPv4(8, 8, 8, 8).To4())
+
+	dst := extractDstIP(pkt)
+
+	// Mutate the original buffer — dst should be unaffected.
+	pkt[16] = 192
+	pkt[17] = 168
+	pkt[18] = 1
+	pkt[19] = 1
+
+	if !dst.Equal(net.IPv4(8, 8, 8, 8)) {
+		t.Fatalf("extractDstIP returned aliased slice — dst changed to %s after buffer mutation", dst)
+	}
+}
+
+// TestExtractDstIP_NoAliasingIPv6 verifies the same no-aliasing
+// guarantee for IPv6 destination addresses.
+func TestExtractDstIP_NoAliasingIPv6(t *testing.T) {
+	pkt6 := make([]byte, 48)
+	pkt6[0] = 0x60
+	want6 := net.ParseIP("2001:db8::1")
+	copy(pkt6[24:40], want6)
+
+	dst6 := extractDstIP(pkt6)
+
+	// Mutate the original buffer
+	for i := 24; i < 40; i++ {
+		pkt6[i] = 0xFF
+	}
+
+	if !dst6.Equal(want6) {
+		t.Fatalf("extractDstIP returned aliased IPv6 slice — dst changed to %s after buffer mutation", dst6)
+	}
+}
+
+// TestExtractDstIP_BufferReuse simulates the monoamp packetBuilder
+// scenario: extractDstIP is called, then the buffer is reused for a
+// different packet, and the first dst IP must still be correct.
+func TestExtractDstIP_BufferReuse(t *testing.T) {
+	buf := make([]byte, 28)
+
+	// First packet: dst = 8.8.8.8
+	buf[0] = 0x45
+	copy(buf[16:20], net.IPv4(8, 8, 8, 8).To4())
+	dst1 := extractDstIP(buf)
+
+	// Reuse buffer for second packet: dst = 1.1.1.1
+	buf[0] = 0x45
+	copy(buf[16:20], net.IPv4(1, 1, 1, 1).To4())
+	dst2 := extractDstIP(buf)
+
+	// dst1 must still be 8.8.8.8 (not 1.1.1.1)
+	if !dst1.Equal(net.IPv4(8, 8, 8, 8)) {
+		t.Errorf("dst1 = %s after buffer reuse, want 8.8.8.8 (aliasing bug)", dst1)
+	}
+	if !dst2.Equal(net.IPv4(1, 1, 1, 1)) {
+		t.Errorf("dst2 = %s, want 1.1.1.1", dst2)
+	}
+}

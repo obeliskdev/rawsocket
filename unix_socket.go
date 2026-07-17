@@ -4,7 +4,7 @@ package rawsocket
 
 import (
 	"errors"
-	"math"
+	"sync"
 
 	"github.com/google/gopacket"
 
@@ -31,19 +31,19 @@ type UnixSocket struct {
 	protocol ProtocolType
 }
 
-var mtu = math.MaxInt16
+// maxIPPacketSize is the maximum size of an IP packet (IPv4 total
+// length field is 16 bits). We use this as the read buffer size so we
+// never truncate a valid packet, regardless of the interface MTU.
+const maxIPPacketSize = 65535
 
-func init() {
-	iface, err := getInterfaceByIP(GetSelfIP())
-	if err != nil || iface == nil || iface.MTU <= 0 {
-		mtu = math.MaxInt16
-		return
-	}
-
-	mtu = iface.MTU + 1
+// readBufPool reuses 65 KB buffers across NextPacket calls. Each
+// buffer is returned to the pool after gopacket has parsed the packet
+// and the caller is done with the data. This avoids a 65 KB heap
+// allocation per packet in the hot read path.
+var readBufPool = sync.Pool{
+	New: func() any { return make([]byte, maxIPPacketSize) },
 }
 
-// newUnixSocket creates a new UnixSocket instance with the given PacketConn.
 func newUnixSocket(conn net.PacketConn, protocol ProtocolType) *UnixSocket {
 	return &UnixSocket{conn: conn, protocol: protocol}
 }
@@ -58,6 +58,12 @@ func (u *UnixSocket) Write(bytes []byte, addr net.Addr) (int, error) {
 // It reads up to len(bytes) bytes into the provided byte slice.
 // It returns the number of bytes read, the network address of the remote socket,
 // and any error encountered.
+//
+// On Linux, raw IP sockets (AF_INET / SOCK_RAW with IP_HDRINCL)
+// deliver the full IP datagram — IP header + transport header +
+// payload. Callers that expect transport-layer data (like monoamp's
+// scanner) must strip the IP header themselves, or use NextPacket
+// which uses gopacket to parse and strip it.
 func (u *UnixSocket) Read(bytes []byte) (int, net.Addr, error) {
 	return u.conn.ReadFrom(bytes)
 }
@@ -76,15 +82,37 @@ func (u *UnixSocket) Close() error {
 	return u.conn.Close()
 }
 
+// NextPacket reads a single packet from the socket and returns a
+// gopacket.Parsed packet plus the source IP address. A pooled buffer
+// is used for the raw read to avoid a 65 KB heap allocation per call.
+// The packet data is copied out of the pooled buffer before parsing so
+// the buffer can be immediately returned to the pool — this is safe
+// and avoids the lifecycle ambiguity of NoCopy with pooled buffers.
+//
+// The copy adds one allocation per packet (the packet data slice),
+// which is the same as the previous implementation. The difference is
+// that the pooled read buffer is reused instead of being allocated
+// and immediately becoming garbage.
 func (u *UnixSocket) NextPacket() (gopacket.Packet, *net.IPAddr, error) {
-	packetData := make([]byte, mtu)
-
-	n, addr, err := u.Read(packetData)
-	if err != nil {
-		return nil, nil, err
+	buf := readBufPool.Get().([]byte)
+	n, addr, err := u.Read(buf)
+	if err != nil || n <= 0 {
+		readBufPool.Put(buf)
+		if err != nil {
+			return nil, nil, err
+		}
+		return nil, nil, nil
 	}
 
-	packet := gopacket.NewPacket(packetData[:n], u.protocol.LinkType(), gopacket.NoCopy)
+	// Copy the packet data into a fresh slice so the pooled buffer can
+	// be returned immediately. gopacket will reference this copy, not
+	// the pooled buffer, so there is no lifecycle coupling between the
+	// returned packet and the pool.
+	packetData := make([]byte, n)
+	copy(packetData, buf)
+	readBufPool.Put(buf)
+
+	packet := gopacket.NewPacket(packetData, u.protocol.LinkType(), gopacket.NoCopy)
 	ipAddr, _ := addr.(*net.IPAddr)
 	return packet, ipAddr, nil
 }
@@ -97,7 +125,9 @@ func (u *UnixSocket) Iter() chan WrappedPacket {
 
 // WriteRaw writes a pre-formatted IP packet directly to the wire.
 // The destination address is extracted from the IP header in the
-// packet so the kernel knows where to route it.
+// packet so the kernel knows where to route it. extractDstIP returns
+// a copy of the destination IP so it is safe even if the caller
+// reuses the packet buffer after this call returns.
 func (u *UnixSocket) WriteRaw(bytes []byte) (int, error) {
 	dst := extractDstIP(bytes)
 	if dst == nil {

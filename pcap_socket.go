@@ -384,6 +384,10 @@ func (p *PcapSocket) Read(bytes []byte) (int, net.Addr, error) {
 	}
 }
 
+// copyLayerData copies the layer's contents and payload into dst.
+// Returns the total number of bytes copied (which may be less than
+// the full layer data if dst is too small). Callers should ensure dst
+// is large enough to hold the full layer data — use 65535 for safety.
 func copyLayerData(dst []byte, layer gopacket.Layer) int {
 	n := copy(dst, layer.LayerContents())
 	n += copy(dst[n:], layer.LayerPayload())
