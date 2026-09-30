@@ -104,13 +104,13 @@ func (r *RawIP) BuildWithError(src, dest net.IPAddr) ([]byte, error) {
 	_, serializableIP, _ := prepareIPLayers(src.IP, dest.IP, r.Protocol, &scratch.ip4, &scratch.ip6)
 
 	var layerBuf [2]gopacket.SerializableLayer
-	layers := layerBuf[:1]
-	layers[0] = serializableIP
+	serializableLayers := layerBuf[:1]
+	serializableLayers[0] = serializableIP
 	if len(r.Payload) > 0 {
-		layers = append(layers, gopacket.Payload(r.Payload))
+		serializableLayers = append(serializableLayers, gopacket.Payload(r.Payload))
 	}
 
-	if err := gopacket.SerializeLayers(scratch.buf, serializeOptions, layers...); err != nil {
+	if err := gopacket.SerializeLayers(scratch.buf, serializeOptions, serializableLayers...); err != nil {
 		return nil, err
 	}
 

@@ -100,14 +100,14 @@ func (tcp *TCP) BuildWithError(src, dest net.TCPAddr) ([]byte, error) {
 	payload := tcp.Payload
 
 	var layerBuf [3]gopacket.SerializableLayer
-	layers := layerBuf[:2]
-	layers[0] = serializableIP
-	layers[1] = &scratch.tcp
+	serializableLayers := layerBuf[:2]
+	serializableLayers[0] = serializableIP
+	serializableLayers[1] = &scratch.tcp
 	if len(payload) > 0 {
-		layers = append(layers, gopacket.Payload(payload))
+		serializableLayers = append(serializableLayers, gopacket.Payload(payload))
 	}
 
-	if err := gopacket.SerializeLayers(scratch.buf, serializeOptions, layers...); err != nil {
+	if err := gopacket.SerializeLayers(scratch.buf, serializeOptions, serializableLayers...); err != nil {
 		return nil, err
 	}
 
